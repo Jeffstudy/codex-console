@@ -214,6 +214,8 @@ class FreemailService(BaseEmailService):
                     mail_id = mail.get("id")
                     if not mail_id or mail_id in seen_mail_ids:
                         continue
+                    if mail.get("is_read") == 1:
+                        continue
 
                     seen_mail_ids.add(mail_id)
 
@@ -231,6 +233,7 @@ class FreemailService(BaseEmailService):
                     if v_code:
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {v_code}")
                         self.update_status(True)
+                        self._make_request("GET", f"/api/email/{mail_id}")
                         return v_code
 
                     # 如果没有直接提供，通过正则匹配 preview
@@ -239,6 +242,7 @@ class FreemailService(BaseEmailService):
                         code = match.group(1)
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
+                        self._make_request("GET", f"/api/email/{mail_id}")
                         return code
 
                     # 如果依然未找到，获取邮件详情进行匹配
