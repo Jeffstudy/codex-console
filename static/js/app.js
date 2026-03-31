@@ -9,6 +9,13 @@ let currentBatch = null;
 let logPollingInterval = null;
 let batchPollingInterval = null;
 let accountsPollingInterval = null;
+let todayStatsPollingInterval = null;
+let todayStatsResetInterval = null;
+let logPollingInFlight = false;
+let batchPollingInFlight = false;
+let outlookBatchPollingInFlight = false;
+let isRecentAccountsLoading = false;
+let isTodayStatsLoading = false;
 let isBatchMode = false;
 let isOutlookBatchMode = false;
 let outlookAccounts = [];
@@ -41,6 +48,7 @@ const elements = {
     form: document.getElementById('registration-form'),
     emailService: document.getElementById('email-service'),
     regMode: document.getElementById('reg-mode'),
+    registrationType: document.getElementById('registration-type'),
     regModeGroup: document.getElementById('reg-mode-group'),
     batchCountGroup: document.getElementById('batch-count-group'),
     batchCount: document.getElementById('batch-count'),
@@ -69,6 +77,12 @@ const elements = {
     // 已注册账号
     recentAccountsTable: document.getElementById('recent-accounts-table'),
     refreshAccountsBtn: document.getElementById('refresh-accounts-btn'),
+    // 今日统计
+    todayStatsTotal: document.getElementById('today-stats-total'),
+    todayStatsSuccess: document.getElementById('today-stats-success'),
+    todayStatsFailed: document.getElementById('today-stats-failed'),
+    todayStatsRate: document.getElementById('today-stats-rate'),
+    todayStatsReset: document.getElementById('today-stats-reset'),
     // Outlook 批量注册
     outlookBatchSection: document.getElementById('outlook-batch-section'),
     outlookAccountsContainer: document.getElementById('outlook-accounts-container'),
@@ -102,6 +116,9 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAvailableServices();
     loadRecentAccounts();
     startAccountsPolling();
+    loadTodayStats(true);
+    startTodayStatsPolling();
+    startTodayStatsResetTicker();
     initVisibilityReconnect();
     restoreActiveTask();
     initAutoUploadOptions();
@@ -218,6 +235,11 @@ function initEventListeners() {
     elements.outlookConcurrencyMode.addEventListener('change', () => {
         handleConcurrencyModeChange(elements.outlookConcurrencyMode, elements.outlookConcurrencyHint, elements.outlookIntervalGroup);
     });
+}
+
+function isIgnorableBackgroundError(error) {
+    const name = String(error?.name || '');
+    return name === 'NetworkOfflineError' || name === 'AbortError';
 }
 
 // 加载可用的邮箱服务
@@ -474,6 +496,7 @@ async function handleStartRegistration(e) {
     // 构建请求数据（代理从设置中自动获取）
     const requestData = {
         email_service_type: emailServiceType,
+        registration_type: elements.registrationType ? elements.registrationType.value : 'none',
         auto_upload_cpa: elements.autoUploadCpa ? elements.autoUploadCpa.checked : false,
         cpa_service_ids: elements.autoUploadCpa && elements.autoUploadCpa.checked ? getSelectedServiceIds(elements.cpaServiceSelect) : [],
         auto_upload_sub2api: elements.autoUploadSub2api ? elements.autoUploadSub2api.checked : false,
@@ -553,6 +576,12 @@ function connectWebSocket(taskUuid) {
                 addLog(logType, data.message);
             } else if (data.type === 'status') {
                 updateTaskStatus(data.status);
+                if (data.email) {
+                    elements.taskEmail.textContent = data.email;
+                }
+                if (data.email_service) {
+                    elements.taskService.textContent = getServiceTypeText(data.email_service);
+                }
 
                 // 检查是否完成
                 if (['completed', 'failed', 'cancelled', 'cancelling'].includes(data.status)) {
@@ -686,7 +715,7 @@ async function handleBatchRegistration(requestData) {
         showBatchStatus(data);
 
         // 优先使用 WebSocket
-        connectBatchWebSocket(data.batch_id);
+        connectBatchWebSocket(data.batch_id, 'batch');
 
     } catch (error) {
         addLog('error', `[错误] 启动失败: ${error.message}`);
@@ -754,11 +783,23 @@ async function handleCancelTask() {
 
 // 开始轮询日志
 function startLogPolling(taskUuid) {
+    stopLogPolling();
     let lastLogIndex = 0;
+    logPollingInFlight = false;
 
     logPollingInterval = setInterval(async () => {
+        if (logPollingInFlight) return;
+        logPollingInFlight = true;
         try {
-            const data = await api.get(`/registration/tasks/${taskUuid}/logs`);
+            const data = await api.get(`/registration/tasks/${taskUuid}/logs`, {
+                timeoutMs: 15000,
+                retry: 0,
+                requestKey: `app:task-logs:${taskUuid}`,
+                cancelPrevious: true,
+                silentNetworkError: true,
+                silentTimeoutError: true,
+                priority: 'low',
+            });
 
             // 更新任务状态
             updateTaskStatus(data.status);
@@ -802,7 +843,11 @@ function startLogPolling(taskUuid) {
                 }
             }
         } catch (error) {
-            console.error('轮询日志失败:', error);
+            if (!isIgnorableBackgroundError(error)) {
+                console.error('轮询日志失败:', error);
+            }
+        } finally {
+            logPollingInFlight = false;
         }
     }, 1000);
 }
@@ -813,13 +858,26 @@ function stopLogPolling() {
         clearInterval(logPollingInterval);
         logPollingInterval = null;
     }
+    logPollingInFlight = false;
 }
 
 // 开始轮询批量状态
 function startBatchPolling(batchId) {
+    stopBatchPolling();
+    batchPollingInFlight = false;
     batchPollingInterval = setInterval(async () => {
+        if (batchPollingInFlight) return;
+        batchPollingInFlight = true;
         try {
-            const data = await api.get(`/registration/batch/${batchId}`);
+            const data = await api.get(`/registration/batch/${batchId}`, {
+                timeoutMs: 15000,
+                retry: 0,
+                requestKey: `app:batch-status:${batchId}`,
+                cancelPrevious: true,
+                silentNetworkError: true,
+                silentTimeoutError: true,
+                priority: 'low',
+            });
             updateBatchProgress(data);
 
             // 检查是否完成
@@ -841,7 +899,11 @@ function startBatchPolling(batchId) {
                 }
             }
         } catch (error) {
-            console.error('轮询批量状态失败:', error);
+            if (!isIgnorableBackgroundError(error)) {
+                console.error('轮询批量状态失败:', error);
+            }
+        } finally {
+            batchPollingInFlight = false;
         }
     }, 2000);
 }
@@ -852,6 +914,8 @@ function stopBatchPolling() {
         clearInterval(batchPollingInterval);
         batchPollingInterval = null;
     }
+    batchPollingInFlight = false;
+    outlookBatchPollingInFlight = false;
 }
 
 // 显示任务状态
@@ -924,10 +988,74 @@ function updateBatchProgress(data) {
     }
 }
 
-// 加载最近注册的账号
-async function loadRecentAccounts() {
+function normalizeRecentRoleTag(roleTag, accountLabel = '') {
+    const role = String(roleTag || '').trim().toLowerCase();
+    if (role === 'parent') return 'parent';
+    if (role === 'child') return 'child';
+    const label = String(accountLabel || '').trim().toLowerCase();
+    if (label === 'mother' || label === 'parent') return 'parent';
+    if (label === 'child') return 'child';
+    return 'none';
+}
+
+function getRecentRoleTagText(roleTag) {
+    if (roleTag === 'parent') return '母号';
+    if (roleTag === 'child') return '子号';
+    return '普通';
+}
+
+function getRecentRoleBadgeClass(roleTag) {
+    if (roleTag === 'parent') return 'parent';
+    if (roleTag === 'child') return 'child';
+    return 'none';
+}
+
+function buildRecentRoleSelectOptions(currentRoleTag) {
+    const role = normalizeRecentRoleTag(currentRoleTag);
+    const options = [
+        { value: 'none', text: '普通' },
+        { value: 'parent', text: '母号' },
+        { value: 'child', text: '子号' },
+    ];
+    return options.map(item => `<option value="${item.value}" ${item.value === role ? 'selected' : ''}>${item.text}</option>`).join('');
+}
+
+async function handleRecentAccountRoleTagChange(selectEl) {
+    const accountId = Number(selectEl?.dataset?.accountRoleId || 0);
+    if (!accountId) return;
+
+    const previousRole = normalizeRecentRoleTag(selectEl.dataset.prevRole || 'none');
+    const nextRole = normalizeRecentRoleTag(selectEl.value || 'none');
+    if (nextRole === previousRole) return;
+
+    selectEl.disabled = true;
     try {
-        const data = await api.get('/accounts?page=1&page_size=10');
+        await api.patch(`/accounts/${accountId}`, { role_tag: nextRole });
+        selectEl.dataset.prevRole = nextRole;
+        toast.success(`账号 #${accountId} 标签已更新为${getRecentRoleTagText(nextRole)}`);
+        await loadRecentAccounts(true);
+    } catch (error) {
+        selectEl.value = previousRole;
+        toast.error(`更新标签失败: ${error.message}`);
+    } finally {
+        selectEl.disabled = false;
+    }
+}
+
+// 加载最近注册的账号
+async function loadRecentAccounts(silent = false) {
+    if (isRecentAccountsLoading) return;
+    isRecentAccountsLoading = true;
+    try {
+        const data = await api.get('/accounts?page=1&page_size=10', {
+            timeoutMs: 30000,
+            retry: silent ? 0 : 1,
+            requestKey: 'app:recent-accounts',
+            cancelPrevious: true,
+            silentNetworkError: silent,
+            silentTimeoutError: silent,
+            priority: silent ? 'low' : 'normal',
+        });
 
         if (data.accounts.length === 0) {
             elements.recentAccountsTable.innerHTML = `
@@ -961,6 +1089,13 @@ async function loadRecentAccounts() {
                         : '-'}
                 </td>
                 <td>
+                    <span class="recent-role-cell">
+                        <span class="recent-role-badge ${getRecentRoleBadgeClass(normalizeRecentRoleTag(account.role_tag, account.account_label))}">
+                            ${getRecentRoleTagText(normalizeRecentRoleTag(account.role_tag, account.account_label))}
+                        </span>
+                    </span>
+                </td>
+                <td>
                     ${getStatusIcon(account.status)}
                 </td>
             </tr>
@@ -973,18 +1108,119 @@ async function loadRecentAccounts() {
         elements.recentAccountsTable.querySelectorAll('.copy-pwd-btn').forEach(btn => {
             btn.addEventListener('click', (e) => { e.stopPropagation(); copyToClipboard(btn.dataset.pwd); });
         });
-
     } catch (error) {
-        console.error('加载账号列表失败:', error);
+        if (!silent || !isIgnorableBackgroundError(error)) {
+            console.error('加载账号列表失败:', error);
+        }
+        if (!silent) {
+            toast.warning('加载账号列表失败，请稍后重试');
+        }
+    } finally {
+        isRecentAccountsLoading = false;
     }
 }
 
 // 开始账号列表轮询
 function startAccountsPolling() {
+    if (accountsPollingInterval) {
+        clearInterval(accountsPollingInterval);
+    }
     // 每30秒刷新一次账号列表
     accountsPollingInterval = setInterval(() => {
-        loadRecentAccounts();
+        loadRecentAccounts(true);
     }, 30000);
+}
+
+function renderTodayStats(total, success, failed, rate) {
+    if (elements.todayStatsTotal) {
+        elements.todayStatsTotal.textContent = String(Math.max(0, total));
+    }
+    if (elements.todayStatsSuccess) {
+        elements.todayStatsSuccess.textContent = String(Math.max(0, success));
+    }
+    if (elements.todayStatsFailed) {
+        elements.todayStatsFailed.textContent = String(Math.max(0, failed));
+    }
+    if (elements.todayStatsRate) {
+        const safeRate = Math.max(0, rate);
+        const rateCard = elements.todayStatsRate.closest('.today-stat-rate');
+        elements.todayStatsRate.textContent = `${safeRate.toFixed(1)}%`;
+        elements.todayStatsRate.classList.remove('rate-high', 'rate-mid', 'rate-low');
+        if (rateCard) {
+            rateCard.classList.remove('rate-high', 'rate-mid', 'rate-low');
+        }
+        if (safeRate >= 70) {
+            elements.todayStatsRate.classList.add('rate-high');
+            if (rateCard) rateCard.classList.add('rate-high');
+        } else if (safeRate < 40) {
+            elements.todayStatsRate.classList.add('rate-low');
+            if (rateCard) rateCard.classList.add('rate-low');
+        } else {
+            elements.todayStatsRate.classList.add('rate-mid');
+            if (rateCard) rateCard.classList.add('rate-mid');
+        }
+    }
+}
+
+async function loadTodayStats(silent = true) {
+    if (isTodayStatsLoading) return;
+    isTodayStatsLoading = true;
+    try {
+        const data = await api.get('/registration/stats', {
+            timeoutMs: 25000,
+            retry: silent ? 0 : 1,
+            requestKey: 'app:today-stats',
+            cancelPrevious: true,
+            silentNetworkError: silent,
+            silentTimeoutError: silent,
+            priority: silent ? 'low' : 'normal',
+        });
+        const byStatus = data?.by_status || {};
+        const total = Number(data?.today_total ?? data?.today_count ?? 0);
+        const success = Number(data?.today_success ?? byStatus.completed ?? 0);
+        const failed = Number(data?.today_failed ?? byStatus.failed ?? 0);
+        const finished = success + failed;
+        const fallbackRate = finished > 0 ? (success / finished) * 100 : 0;
+        const rate = Number(data?.today_success_rate ?? fallbackRate);
+        renderTodayStats(total, success, failed, Number.isFinite(rate) ? rate : 0);
+    } catch (error) {
+        if (!silent || !isIgnorableBackgroundError(error)) {
+            console.error('加载今日统计失败:', error);
+        }
+        if (!silent) {
+            toast.error('加载今日统计失败');
+        }
+    } finally {
+        isTodayStatsLoading = false;
+    }
+}
+
+function updateTodayStatsResetText() {
+    if (!elements.todayStatsReset) return;
+    const now = new Date();
+    const next = new Date();
+    next.setHours(24, 0, 0, 0);
+    const remain = Math.max(0, next.getTime() - now.getTime());
+    const hours = Math.floor(remain / 3600000);
+    const minutes = Math.floor((remain % 3600000) / 60000);
+    elements.todayStatsReset.textContent = `重置剩余 ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+}
+
+function startTodayStatsResetTicker() {
+    updateTodayStatsResetText();
+    if (todayStatsResetInterval) {
+        clearInterval(todayStatsResetInterval);
+    }
+    todayStatsResetInterval = setInterval(updateTodayStatsResetText, 60000);
+}
+
+function startTodayStatsPolling() {
+    if (todayStatsPollingInterval) {
+        clearInterval(todayStatsPollingInterval);
+    }
+    todayStatsPollingInterval = setInterval(() => {
+        loadTodayStats(true);
+    }, 60000);
 }
 
 // 添加日志
@@ -1111,7 +1347,7 @@ function renderOutlookAccountsList() {
                 <div style="font-weight: 500;">${escapeHtml(account.email)}</div>
                 <div style="font-size: 0.75rem; color: var(--text-muted);">
                     ${account.is_registered
-                        ? `<span style="color: var(--success-color);">✓ 已注册</span>`
+                        ? `<span style="color: var(--success-color);">✓ 已注册${account.registered_account_id ? ` #${account.registered_account_id}` : ''}</span>`
                         : '<span style="color: var(--primary-color);">未注册</span>'
                     }
                     ${account.has_oauth ? ' | OAuth' : ''}
@@ -1180,6 +1416,7 @@ async function handleOutlookBatchRegistration() {
     const requestData = {
         service_ids: selectedIds,
         skip_registered: skipRegistered,
+        registration_type: elements.registrationType ? elements.registrationType.value : 'none',
         interval_min: intervalMin,
         interval_max: intervalMax,
         concurrency: Math.min(50, Math.max(1, concurrency)),
@@ -1215,7 +1452,7 @@ async function handleOutlookBatchRegistration() {
         showBatchStatus({ count: data.to_register });
 
         // 优先使用 WebSocket
-        connectBatchWebSocket(data.batch_id);
+        connectBatchWebSocket(data.batch_id, 'outlook_batch');
 
     } catch (error) {
         addLog('error', `[错误] 启动失败: ${error.message}`);
@@ -1226,8 +1463,26 @@ async function handleOutlookBatchRegistration() {
 
 // ============== 批量任务 WebSocket 功能 ==============
 
+function normalizeBatchMode(mode) {
+    const text = String(mode || '').trim().toLowerCase();
+    if (text === 'outlook_batch') return 'outlook_batch';
+    if (text === 'batch') return 'batch';
+    return isOutlookBatchMode ? 'outlook_batch' : 'batch';
+}
+
+function startCurrentBatchPolling(batchId, mode = null) {
+    const normalizedMode = normalizeBatchMode(mode);
+    if (normalizedMode === 'outlook_batch') {
+        startOutlookBatchPolling(batchId);
+        return;
+    }
+    startBatchPolling(batchId);
+}
+
 // 连接批量任务 WebSocket
-function connectBatchWebSocket(batchId) {
+function connectBatchWebSocket(batchId, mode = null) {
+    const batchMode = normalizeBatchMode(mode);
+    const batchLabel = batchMode === 'outlook_batch' ? 'Outlook 批量任务' : '批量任务';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/api/ws/batch/${batchId}`;
 
@@ -1275,12 +1530,12 @@ function connectBatchWebSocket(batchId) {
                     if (!toastShown) {
                         toastShown = true;
                         if (data.status === 'completed') {
-                            addLog('success', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
+                            addLog('success', `[完成] ${batchLabel}完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
                             if (data.success > 0) {
-                                toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
+                                toast.success(`${batchLabel}完成，成功 ${data.success} 个`);
                                 loadRecentAccounts();
                             } else {
-                                toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
+                                toast.warning(`${batchLabel}完成，但没有成功注册任何账号`);
                             }
                         } else if (data.status === 'failed') {
                             addLog('error', '[错误] 批量任务执行失败');
@@ -1306,7 +1561,7 @@ function connectBatchWebSocket(batchId) {
 
             if (shouldPoll && currentBatch) {
                 console.log('切换到轮询模式');
-                startOutlookBatchPolling(currentBatch.batch_id);
+                startCurrentBatchPolling(currentBatch.batch_id, batchMode);
             }
         };
 
@@ -1314,12 +1569,12 @@ function connectBatchWebSocket(batchId) {
             console.error('批量任务 WebSocket 错误:', error);
             stopBatchWebSocketHeartbeat();
             // 切换到轮询
-            startOutlookBatchPolling(batchId);
+            startCurrentBatchPolling(batchId, batchMode);
         };
 
     } catch (error) {
         console.error('批量任务 WebSocket 连接失败:', error);
-        startOutlookBatchPolling(batchId);
+        startCurrentBatchPolling(batchId, batchMode);
     }
 }
 
@@ -1359,9 +1614,22 @@ function cancelBatchViaWebSocket() {
 
 // 开始轮询 Outlook 批量状态（降级方案）
 function startOutlookBatchPolling(batchId) {
+    stopBatchPolling();
+    let lastLogIndex = 0;
+    outlookBatchPollingInFlight = false;
     batchPollingInterval = setInterval(async () => {
+        if (outlookBatchPollingInFlight) return;
+        outlookBatchPollingInFlight = true;
         try {
-            const data = await api.get(`/registration/outlook-batch/${batchId}`);
+            const data = await api.get(`/registration/outlook-batch/${batchId}`, {
+                timeoutMs: 15000,
+                retry: 0,
+                requestKey: `app:outlook-batch-status:${batchId}`,
+                cancelPrevious: true,
+                silentNetworkError: true,
+                silentTimeoutError: true,
+                priority: 'low',
+            });
 
             // 更新进度
             updateBatchProgress({
@@ -1373,13 +1641,12 @@ function startOutlookBatchPolling(batchId) {
 
             // 输出日志
             if (data.logs && data.logs.length > 0) {
-                const lastLogIndex = batchPollingInterval.lastLogIndex || 0;
                 for (let i = lastLogIndex; i < data.logs.length; i++) {
                     const log = data.logs[i];
                     const logType = getLogType(log);
                     addLog(logType, log);
                 }
-                batchPollingInterval.lastLogIndex = data.logs.length;
+                lastLogIndex = data.logs.length;
             }
 
             // 检查是否完成
@@ -1400,11 +1667,13 @@ function startOutlookBatchPolling(batchId) {
                 }
             }
         } catch (error) {
-            console.error('轮询 Outlook 批量状态失败:', error);
+            if (!isIgnorableBackgroundError(error)) {
+                console.error('轮询 Outlook 批量状态失败:', error);
+            }
+        } finally {
+            outlookBatchPollingInFlight = false;
         }
     }, 2000);
-
-    batchPollingInterval.lastLogIndex = 0;
 }
 
 // ============== 页面可见性重连机制 ==============
@@ -1428,7 +1697,7 @@ function initVisibilityReconnect() {
         if (activeBatchId && !batchCompleted && batchWsDisconnected) {
             console.log('[重连] 页面重新可见，重连批量任务 WebSocket:', activeBatchId);
             addLog('info', '[系统] 页面重新激活，正在重连批量任务监控...');
-            connectBatchWebSocket(activeBatchId);
+            connectBatchWebSocket(activeBatchId, isOutlookBatchMode ? 'outlook_batch' : 'batch');
         }
     });
 }
@@ -1496,9 +1765,10 @@ async function restoreActiveTask() {
             showBatchStatus({ count: total || data.total });
             updateBatchProgress(data);
             addLog('info', `[系统] 检测到进行中的批量任务，正在重连监控... (${batch_id.substring(0, 8)})`);
-            connectBatchWebSocket(batch_id);
+            connectBatchWebSocket(batch_id, mode);
         } catch {
             sessionStorage.removeItem('activeTask');
         }
     }
 }
+

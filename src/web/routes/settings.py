@@ -4,13 +4,15 @@
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Any, Dict, List, Tuple, Set
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 from ...config.settings import get_settings, update_settings
 from ...database import crud
+from ...database.models import Proxy
 from ...database.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ class RegistrationSettings(BaseModel):
     default_password_length: int = 12
     sleep_min: int = 5
     sleep_max: int = 30
+    entry_flow: str = "native"
 
 
 class WebUISettings(BaseModel):
@@ -59,11 +62,57 @@ class WebUISettings(BaseModel):
     access_password: Optional[str] = None
 
 
+class AutoQuickRefreshSettings(BaseModel):
+    """账号管理自动一键刷新设置"""
+    enabled: bool = False
+    interval_minutes: int = 30
+    retry_limit: int = 2
+    run_now: bool = False
+
+
+class CircuitBreakerSettings(BaseModel):
+    enabled: bool = True
+    failure_threshold: int = 5
+    cooldown_seconds: int = 180
+    probe_interval_seconds: int = 30
+
+
 class AllSettings(BaseModel):
     """所有设置"""
     proxy: ProxySettings
     registration: RegistrationSettings
     webui: WebUISettings
+
+
+def _verify_auto_quick_refresh_settings_persisted(
+    *,
+    enabled: bool,
+    interval_minutes: int,
+    retry_limit: int,
+) -> Tuple[bool, List[str]]:
+    """保存后回读数据库，确保设置真正落库。"""
+    expected = {
+        "webui.auto_quick_refresh.enabled": "true" if enabled else "false",
+        "webui.auto_quick_refresh.interval_minutes": str(interval_minutes),
+        "webui.auto_quick_refresh.retry_limit": str(retry_limit),
+    }
+    mismatches: List[str] = []
+
+    try:
+        with get_db() as db:
+            for key, expected_value in expected.items():
+                row = crud.get_setting(db, key)
+                actual_value = ""
+                if row and row.value is not None:
+                    actual_value = str(row.value).strip()
+                if actual_value != expected_value:
+                    mismatches.append(
+                        f"{key}: expected={expected_value}, actual={actual_value or '<missing>'}"
+                    )
+    except Exception as e:
+        mismatches.append(f"db_error: {e}")
+
+    return len(mismatches) == 0, mismatches
 
 
 # ============== API Endpoints ==============
@@ -72,6 +121,9 @@ class AllSettings(BaseModel):
 async def get_all_settings():
     """获取所有设置"""
     settings = get_settings()
+
+    entry_flow_raw = str(settings.registration_entry_flow or "native").strip().lower()
+    entry_flow = "abcard" if entry_flow_raw == "abcard" else "native"
 
     return {
         "proxy": {
@@ -93,12 +145,24 @@ async def get_all_settings():
             "default_password_length": settings.registration_default_password_length,
             "sleep_min": settings.registration_sleep_min,
             "sleep_max": settings.registration_sleep_max,
+            "entry_flow": entry_flow,
         },
         "webui": {
             "host": settings.webui_host,
             "port": settings.webui_port,
             "debug": settings.debug,
             "has_access_password": bool(settings.webui_access_password and settings.webui_access_password.get_secret_value()),
+        },
+        "auto_quick_refresh": {
+            "enabled": bool(getattr(settings, "auto_quick_refresh_enabled", False)),
+            "interval_minutes": int(getattr(settings, "auto_quick_refresh_interval_minutes", 30) or 30),
+            "retry_limit": int(getattr(settings, "auto_quick_refresh_retry_limit", 2) or 2),
+        },
+        "circuit_breaker": {
+            "enabled": bool(getattr(settings, "circuit_breaker_enabled", True)),
+            "failure_threshold": int(getattr(settings, "circuit_breaker_failure_threshold", 5) or 5),
+            "cooldown_seconds": int(getattr(settings, "circuit_breaker_cooldown_seconds", 180) or 180),
+            "probe_interval_seconds": int(getattr(settings, "circuit_breaker_probe_interval_seconds", 30) or 30),
         },
         "tempmail": {
             "base_url": settings.tempmail_base_url,
@@ -110,6 +174,83 @@ async def get_all_settings():
             "poll_interval": settings.email_code_poll_interval,
         },
     }
+
+
+@router.get("/auto-quick-refresh")
+async def get_auto_quick_refresh_settings():
+    """获取账号管理自动一键刷新设置与运行状态"""
+    from ..auto_quick_refresh_scheduler import auto_quick_refresh_scheduler
+
+    settings = get_settings()
+    return {
+        "enabled": bool(getattr(settings, "auto_quick_refresh_enabled", False)),
+        "interval_minutes": int(getattr(settings, "auto_quick_refresh_interval_minutes", 30) or 30),
+        "retry_limit": int(getattr(settings, "auto_quick_refresh_retry_limit", 2) or 2),
+        "runtime": auto_quick_refresh_scheduler.snapshot(),
+    }
+
+
+@router.post("/auto-quick-refresh")
+async def update_auto_quick_refresh_settings(request: AutoQuickRefreshSettings):
+    """更新账号管理自动一键刷新设置"""
+    from ..auto_quick_refresh_scheduler import auto_quick_refresh_scheduler
+
+    interval_minutes = max(5, min(24 * 60, int(request.interval_minutes or 30)))
+    retry_limit = max(0, min(5, int(request.retry_limit or 0)))
+
+    update_settings(
+        auto_quick_refresh_enabled=bool(request.enabled),
+        auto_quick_refresh_interval_minutes=interval_minutes,
+        auto_quick_refresh_retry_limit=retry_limit,
+    )
+    persisted_ok, mismatches = _verify_auto_quick_refresh_settings_persisted(
+        enabled=bool(request.enabled),
+        interval_minutes=interval_minutes,
+        retry_limit=retry_limit,
+    )
+    if not persisted_ok:
+        logger.error("自动一键刷新设置落库校验失败: %s", "; ".join(mismatches))
+        raise HTTPException(
+            status_code=500,
+            detail="自动一键刷新设置保存失败（数据库写入未生效），请重试",
+        )
+
+    auto_quick_refresh_scheduler.notify_schedule_updated()
+    if request.run_now and request.enabled:
+        auto_quick_refresh_scheduler.request_run_now("manual")
+
+    return {
+        "success": True,
+        "message": "自动一键刷新设置已更新",
+        "schedule": {
+            "enabled": bool(request.enabled),
+            "interval_minutes": interval_minutes,
+            "retry_limit": retry_limit,
+        },
+        "runtime": auto_quick_refresh_scheduler.snapshot(),
+    }
+
+
+@router.get("/runtime/circuit-breaker")
+async def get_circuit_breaker_settings():
+    settings = get_settings()
+    return {
+        "enabled": bool(getattr(settings, "circuit_breaker_enabled", True)),
+        "failure_threshold": int(getattr(settings, "circuit_breaker_failure_threshold", 5) or 5),
+        "cooldown_seconds": int(getattr(settings, "circuit_breaker_cooldown_seconds", 180) or 180),
+        "probe_interval_seconds": int(getattr(settings, "circuit_breaker_probe_interval_seconds", 30) or 30),
+    }
+
+
+@router.post("/runtime/circuit-breaker")
+async def update_circuit_breaker_settings(request: CircuitBreakerSettings):
+    update_settings(
+        circuit_breaker_enabled=bool(request.enabled),
+        circuit_breaker_failure_threshold=max(1, min(20, int(request.failure_threshold or 1))),
+        circuit_breaker_cooldown_seconds=max(10, min(3600, int(request.cooldown_seconds or 10))),
+        circuit_breaker_probe_interval_seconds=max(3, min(600, int(request.probe_interval_seconds or 3))),
+    )
+    return {"success": True, "message": "熔断器设置已更新"}
 
 
 @router.get("/proxy/dynamic")
@@ -202,24 +343,35 @@ async def get_registration_settings():
     """获取注册设置"""
     settings = get_settings()
 
+    entry_flow_raw = str(settings.registration_entry_flow or "native").strip().lower()
+    entry_flow = "abcard" if entry_flow_raw == "abcard" else "native"
+
     return {
         "max_retries": settings.registration_max_retries,
         "timeout": settings.registration_timeout,
         "default_password_length": settings.registration_default_password_length,
         "sleep_min": settings.registration_sleep_min,
         "sleep_max": settings.registration_sleep_max,
+        "entry_flow": entry_flow,
     }
 
 
 @router.post("/registration")
 async def update_registration_settings(request: RegistrationSettings):
     """更新注册设置"""
+    flow_raw = (request.entry_flow or "native").strip().lower()
+    # 兼容旧前端历史值：outlook -> native（Outlook 邮箱会在运行时自动走 outlook 链路）。
+    flow = "native" if flow_raw == "outlook" else flow_raw
+    if flow not in {"native", "abcard"}:
+        raise HTTPException(status_code=400, detail="entry_flow 仅支持 native / abcard")
+
     update_settings(
         registration_max_retries=request.max_retries,
         registration_timeout=request.timeout,
         registration_default_password_length=request.default_password_length,
         registration_sleep_min=request.sleep_min,
         registration_sleep_max=request.sleep_max,
+        registration_entry_flow=flow,
     )
 
     return {"success": True, "message": "注册设置已更新"}
@@ -306,6 +458,97 @@ async def backup_database():
         "message": "数据库备份成功",
         "backup_path": str(backup_path)
     }
+
+
+@router.post("/database/import")
+async def import_database(file: UploadFile = File(...)):
+    """导入数据库（自动备份后覆盖当前 SQLite 文件）"""
+    import shutil
+    import tempfile
+    from datetime import datetime
+    from pathlib import Path as FilePath
+    from ...database.session import get_session_manager
+
+    settings = get_settings()
+
+    db_path = settings.database_url
+    if not db_path.startswith("sqlite:///"):
+        raise HTTPException(status_code=400, detail="当前仅支持 SQLite 数据库导入")
+
+    db_path = db_path[10:]
+    db_file = FilePath(db_path)
+
+    # 校验上传扩展名
+    filename = (file.filename or "").lower()
+    allowed_ext = (".db", ".sqlite", ".sqlite3")
+    if filename and not filename.endswith(allowed_ext):
+        raise HTTPException(status_code=400, detail="仅支持 .db / .sqlite / .sqlite3 文件")
+
+    if not db_file.exists():
+        raise HTTPException(status_code=404, detail="数据库文件不存在")
+
+    # 先落地到临时文件，再校验头，避免脏写
+    temp_path = None
+    try:
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix="db_import_",
+            suffix=".db",
+            dir=str(db_file.parent),
+            delete=False
+        ) as tmp:
+            temp_path = FilePath(tmp.name)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
+        if not temp_path.exists() or temp_path.stat().st_size < 100:
+            raise HTTPException(status_code=400, detail="导入文件无效或为空")
+
+        # SQLite 文件头校验
+        with temp_path.open("rb") as f:
+            header = f.read(16)
+        if not header.startswith(b"SQLite format 3\x00"):
+            raise HTTPException(status_code=400, detail="文件不是有效的 SQLite 数据库")
+
+        # 先释放数据库连接，避免 Windows 下文件被占用
+        session_manager = get_session_manager()
+        session_manager.engine.dispose()
+
+        # 导入前自动备份
+        backup_dir = db_file.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"database_backup_before_import_{timestamp}.db"
+        shutil.copy2(db_file, backup_path)
+
+        # 清理 WAL/SHM，避免替换后出现旧事务残留
+        wal_file = FilePath(f"{db_file}-wal")
+        shm_file = FilePath(f"{db_file}-shm")
+        for sidecar in (wal_file, shm_file):
+            try:
+                if sidecar.exists():
+                    sidecar.unlink()
+            except Exception:
+                logger.warning("清理 SQLite 附属文件失败: %s", sidecar)
+
+        os.replace(str(temp_path), str(db_file))
+
+        logger.info("数据库导入成功: file=%s backup=%s", file.filename, backup_path)
+        return {
+            "success": True,
+            "message": "数据库导入成功",
+            "backup_path": str(backup_path),
+        }
+    finally:
+        await file.close()
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
 
 @router.post("/database/cleanup")
@@ -469,6 +712,106 @@ class ProxyUpdateRequest(BaseModel):
     priority: Optional[int] = None
 
 
+class ProxyBatchImportRequest(BaseModel):
+    """批量导入代理请求"""
+    content: str
+    default_type: str = "http"
+    enabled: bool = True
+    overwrite_existing: bool = False
+
+
+def _normalize_proxy_type(proxy_type: Optional[str]) -> str:
+    value = str(proxy_type or "http").strip().lower()
+    if value in {"http", "https"}:
+        return "http"
+    if value in {"socks", "socks5", "socks5h"}:
+        return "socks5"
+    return "http"
+
+
+def _build_proxy_key(proxy_type: str, host: str, port: int, username: Optional[str]) -> Tuple[str, str, int, str]:
+    return (
+        _normalize_proxy_type(proxy_type),
+        str(host or "").strip().lower(),
+        int(port or 0),
+        str(username or "").strip(),
+    )
+
+
+def _parse_proxy_import_line(line: str, default_type: str) -> Optional[Dict[str, Any]]:
+    raw = str(line or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("#") or raw.startswith("//"):
+        return None
+
+    # 支持 CSV: name,type,host,port[,username[,password]]
+    parts = [item.strip() for item in raw.split(",")]
+    if len(parts) >= 4 and _normalize_proxy_type(parts[1]) in {"http", "socks5"}:
+        name = parts[0] or ""
+        proxy_type = _normalize_proxy_type(parts[1])
+        host = parts[2]
+        try:
+            port = int(parts[3])
+        except Exception as exc:
+            raise ValueError("CSV 端口无效") from exc
+        if port <= 0 or port > 65535:
+            raise ValueError("端口必须在 1-65535 之间")
+        username = parts[4] if len(parts) >= 5 and parts[4] else None
+        password = parts[5] if len(parts) >= 6 and parts[5] else None
+        if not host:
+            raise ValueError("主机不能为空")
+        return {
+            "name": (name or f"{host}:{port}")[:100],
+            "type": proxy_type,
+            "host": host[:255],
+            "port": int(port),
+            "username": (username[:100] if username else None),
+            "password": (password[:255] if password else None),
+            "auth_provided": bool(username or password),
+        }
+
+    # 支持 name,proxy_line 形式
+    custom_name = ""
+    payload = raw
+    if "," in raw:
+        first, rest = raw.split(",", 1)
+        if rest.strip():
+            custom_name = first.strip()
+            payload = rest.strip()
+
+    source = payload if "://" in payload else f"{default_type}://{payload}"
+    try:
+        parsed = urlparse(source)
+    except Exception as exc:
+        raise ValueError("代理格式解析失败") from exc
+
+    host = str(parsed.hostname or "").strip()
+    if not host:
+        raise ValueError("主机不能为空")
+    try:
+        port = int(parsed.port) if parsed.port else 0
+    except Exception as exc:
+        raise ValueError("端口无效") from exc
+    if port <= 0 or port > 65535:
+        raise ValueError("端口必须在 1-65535 之间")
+
+    proxy_type = _normalize_proxy_type(parsed.scheme or default_type)
+    username = str(parsed.username or "").strip() or None
+    password = str(parsed.password or "").strip() or None
+    name = custom_name or f"{host}:{port}"
+
+    return {
+        "name": name[:100],
+        "type": proxy_type,
+        "host": host[:255],
+        "port": int(port),
+        "username": (username[:100] if username else None),
+        "password": (password[:255] if password else None),
+        "auth_provided": bool(parsed.username is not None or parsed.password is not None),
+    }
+
+
 @router.get("/proxies")
 async def get_proxies_list(enabled: Optional[bool] = None):
     """获取代理列表"""
@@ -478,6 +821,100 @@ async def get_proxies_list(enabled: Optional[bool] = None):
             "proxies": [p.to_dict() for p in proxies],
             "total": len(proxies)
         }
+
+
+@router.post("/proxies/batch-import")
+async def batch_import_proxies(request: ProxyBatchImportRequest):
+    """批量导入代理"""
+    default_type = _normalize_proxy_type(request.default_type)
+    lines = str(request.content or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if len(lines) > 5000:
+        raise HTTPException(status_code=400, detail="导入行数过多，最多支持 5000 行")
+
+    parsed_rows: List[Tuple[int, Dict[str, Any]]] = []
+    errors: List[Dict[str, Any]] = []
+    for idx, line in enumerate(lines, start=1):
+        try:
+            parsed = _parse_proxy_import_line(line, default_type)
+            if parsed:
+                parsed_rows.append((idx, parsed))
+        except Exception as exc:
+            errors.append({
+                "line": idx,
+                "raw": str(line or "")[:200],
+                "error": str(exc),
+            })
+
+    if not parsed_rows and not errors:
+        raise HTTPException(status_code=400, detail="没有可导入的代理，请检查输入格式")
+
+    created = 0
+    updated = 0
+    skipped = 0
+
+    with get_db() as db:
+        existing = crud.get_proxies(db, limit=100000)
+        existing_map: Dict[Tuple[str, str, int, str], Proxy] = {}
+        for p in existing:
+            key = _build_proxy_key(p.type, p.host, p.port, p.username)
+            existing_map[key] = p
+
+        seen_keys: Set[Tuple[str, str, int, str]] = set()
+        for line_no, item in parsed_rows:
+            key = _build_proxy_key(item["type"], item["host"], item["port"], item.get("username"))
+            if key in seen_keys:
+                skipped += 1
+                continue
+            seen_keys.add(key)
+
+            proxy = existing_map.get(key)
+            try:
+                if proxy:
+                    if request.overwrite_existing:
+                        proxy.name = item["name"]
+                        proxy.enabled = bool(request.enabled)
+                        if item.get("auth_provided"):
+                            proxy.username = item.get("username")
+                            proxy.password = item.get("password")
+                        updated += 1
+                    else:
+                        skipped += 1
+                    continue
+
+                db.add(
+                    Proxy(
+                        name=item["name"],
+                        type=item["type"],
+                        host=item["host"],
+                        port=item["port"],
+                        username=item.get("username"),
+                        password=item.get("password"),
+                        enabled=bool(request.enabled),
+                        priority=0,
+                    )
+                )
+                created += 1
+            except Exception as exc:
+                errors.append({
+                    "line": line_no,
+                    "raw": str(lines[line_no - 1] if line_no - 1 < len(lines) else "")[:200],
+                    "error": str(exc),
+                })
+
+        if created or updated:
+            db.commit()
+            crud._ensure_single_default_proxy(db)
+
+    return {
+        "success": True,
+        "total_lines": len(lines),
+        "valid_rows": len(parsed_rows),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "failed": len(errors),
+        "errors": errors[:100],
+    }
 
 
 @router.post("/proxies")

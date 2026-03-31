@@ -11,7 +11,13 @@ from typing import List, Optional, Dict, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 
+from ...config.constants import (
+    RoleTag,
+    normalize_role_tag,
+    role_tag_to_account_label,
+)
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
@@ -77,6 +83,7 @@ class RegistrationTaskCreate(BaseModel):
     sub2api_service_ids: List[int] = []  # 指定 Sub2API 服务 ID 列表
     auto_upload_tm: bool = False
     tm_service_ids: List[int] = []  # 指定 TM 服务 ID 列表
+    registration_type: str = RoleTag.CHILD.value  # none / parent / child
 
 
 class BatchRegistrationRequest(BaseModel):
@@ -96,6 +103,7 @@ class BatchRegistrationRequest(BaseModel):
     sub2api_service_ids: List[int] = []
     auto_upload_tm: bool = False
     tm_service_ids: List[int] = []
+    registration_type: str = RoleTag.CHILD.value  # none / parent / child
 
 
 class RegistrationTaskResponse(BaseModel):
@@ -164,6 +172,7 @@ class OutlookBatchRegistrationRequest(BaseModel):
     sub2api_service_ids: List[int] = []
     auto_upload_tm: bool = False
     tm_service_ids: List[int] = []
+    registration_type: str = RoleTag.CHILD.value  # none / parent / child
 
 
 class OutlookBatchRegistrationResponse(BaseModel):
@@ -221,7 +230,7 @@ def _normalize_email_service_config(
     return normalized
 
 
-def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
+def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, registration_type: str = RoleTag.CHILD.value):
     """
     在线程池中执行的同步注册任务
 
@@ -329,8 +338,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         email = svc.config.get("email") if svc.config else None
                         if not email:
                             continue
+                        normalized_email = str(email).strip().lower()
                         # 检查是否已在 accounts 表中注册
-                        existing = db.query(Account).filter(Account.email == email).first()
+                        existing = db.query(Account).filter(
+                            func.lower(Account.email) == normalized_email
+                        ).first()
                         if not existing:
                             selected_service = svc
                             logger.info(f"选择未注册的 Outlook 账户: {email}")
@@ -402,14 +414,22 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             )
 
             # 执行注册
+            role_tag = normalize_role_tag(registration_type)
+            account_label = role_tag_to_account_label(role_tag)
             result = engine.run()
 
             if result.success:
                 # 更新代理使用时间
                 update_proxy_usage(db, proxy_id)
 
+                metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                metadata["account_label"] = account_label
+                metadata["role_tag"] = role_tag
+                metadata["registration_type"] = role_tag
+                result.metadata = metadata
+
                 # 保存到数据库
-                engine.save_to_database(result)
+                engine.save_to_database(result, account_label=account_label, role_tag=role_tag)
 
                 # 自动上传到 CPA（可多服务）
                 if auto_upload_cpa:
@@ -538,7 +558,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 pass
 
 
-async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
+async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, registration_type: str = RoleTag.CHILD.value):
     """
     异步执行注册任务
 
@@ -571,6 +591,7 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
             sub2api_service_ids or [],
             auto_upload_tm,
             tm_service_ids or [],
+            registration_type,
         )
     except Exception as e:
         logger.error(f"线程池执行异常: {task_uuid}, 错误: {e}")
@@ -623,6 +644,7 @@ async def run_batch_parallel(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     并行模式：所有任务同时提交，Semaphore 控制最大并发数
@@ -642,6 +664,7 @@ async def run_batch_parallel(
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
                 auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
+                registration_type=registration_type,
             )
         with get_db() as db:
             t = crud.get_registration_task(db, uuid)
@@ -689,6 +712,7 @@ async def run_batch_pipeline(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     流水线模式：每隔 interval 秒启动一个新任务，Semaphore 限制最大并发数
@@ -708,6 +732,7 @@ async def run_batch_pipeline(
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
                 auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
+                registration_type=registration_type,
             )
             with get_db() as db:
                 t = crud.get_registration_task(db, uuid)
@@ -779,6 +804,7 @@ async def run_batch_registration(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """根据 mode 分发到并行或流水线执行"""
     if mode == "parallel":
@@ -788,6 +814,7 @@ async def run_batch_registration(
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
+            registration_type=registration_type,
         )
     else:
         await run_batch_pipeline(
@@ -797,6 +824,7 @@ async def run_batch_registration(
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
+            registration_type=registration_type,
         )
 
 
@@ -849,6 +877,7 @@ async def start_registration(
         request.sub2api_service_ids,
         request.auto_upload_tm,
         request.tm_service_ids,
+        request.registration_type,
     )
 
     return task_to_response(task)
@@ -862,15 +891,15 @@ async def start_batch_registration(
     """
     启动批量注册任务
 
-    - count: 注册数量 (1-100)
+    - count: 注册数量 (1-1000)
     - email_service_type: 邮箱服务类型
     - proxy: 代理地址
     - interval_min: 最小间隔秒数
     - interval_max: 最大间隔秒数
     """
     # 验证参数
-    if request.count < 1 or request.count > 100:
-        raise HTTPException(status_code=400, detail="注册数量必须在 1-100 之间")
+    if request.count < 1 or request.count > 1000:
+        raise HTTPException(status_code=400, detail="注册数量必须在 1-1000 之间")
 
     try:
         EmailServiceType(request.email_service_type)
@@ -926,6 +955,7 @@ async def start_batch_registration(
         request.sub2api_service_ids,
         request.auto_upload_tm,
         request.tm_service_ids,
+        request.registration_type,
     )
 
     return BatchRegistrationResponse(
@@ -1012,9 +1042,14 @@ async def get_task_logs(task_uuid: str):
             raise HTTPException(status_code=404, detail="任务不存在")
 
         logs = task.logs or ""
+        result = task.result if isinstance(task.result, dict) else {}
+        email = result.get("email")
+        service_type = task.email_service.service_type if task.email_service else None
         return {
             "task_uuid": task_uuid,
             "status": task.status,
+            "email": email,
+            "email_service": service_type,
             "logs": logs.split("\n") if logs else []
         }
 
@@ -1063,15 +1098,30 @@ async def get_registration_stats():
             func.count(RegistrationTask.id)
         ).group_by(RegistrationTask.status).all()
 
-        # 今日注册数
+        # 今日统计
         today = datetime.utcnow().date()
-        today_count = db.query(func.count(RegistrationTask.id)).filter(
+        today_status_stats = db.query(
+            RegistrationTask.status,
+            func.count(RegistrationTask.id)
+        ).filter(
             func.date(RegistrationTask.created_at) == today
-        ).scalar()
+        ).group_by(RegistrationTask.status).all()
+
+        today_by_status = {status: count for status, count in today_status_stats}
+        today_success = int(today_by_status.get("completed", 0))
+        today_failed = int(today_by_status.get("failed", 0))
+        # 今日“注册”口径：仅统计成功 + 失败（不包含 cancelled/running 等）
+        today_total = today_success + today_failed
+        today_success_rate = round((today_success / today_total) * 100, 1) if today_total > 0 else 0.0
 
         return {
             "by_status": {status: count for status, count in status_stats},
-            "today_count": today_count
+            "today_count": today_total,
+            "today_total": today_total,
+            "today_success": today_success,
+            "today_failed": today_failed,
+            "today_success_rate": today_success_rate,
+            "today_by_status": today_by_status,
         }
 
 
@@ -1286,10 +1336,11 @@ async def get_outlook_accounts_for_registration():
         for service in outlook_services:
             config = service.config or {}
             email = config.get("email") or service.name
+            normalized_email = str(email or "").strip().lower()
 
             # 检查是否已注册（查询 accounts 表）
             existing_account = db.query(Account).filter(
-                Account.email == email
+                func.lower(Account.email) == normalized_email
             ).first()
 
             is_registered = existing_account is not None
@@ -1330,6 +1381,7 @@ async def run_outlook_batch_registration(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     异步执行 Outlook 批量注册任务，复用通用并发逻辑
@@ -1373,6 +1425,7 @@ async def run_outlook_batch_registration(
         sub2api_service_ids=sub2api_service_ids,
         auto_upload_tm=auto_upload_tm,
         tm_service_ids=tm_service_ids,
+        registration_type=registration_type,
     )
 
 
@@ -1423,10 +1476,11 @@ async def start_outlook_batch_registration(
 
                 config = service.config or {}
                 email = config.get("email") or service.name
+                normalized_email = str(email or "").strip().lower()
 
                 # 检查是否已注册
                 existing_account = db.query(Account).filter(
-                    Account.email == email
+                    func.lower(Account.email) == normalized_email
                 ).first()
 
                 if existing_account:
@@ -1477,6 +1531,7 @@ async def start_outlook_batch_registration(
         request.sub2api_service_ids,
         request.auto_upload_tm,
         request.tm_service_ids,
+        request.registration_type,
     )
 
     return OutlookBatchRegistrationResponse(
@@ -1525,3 +1580,4 @@ async def cancel_outlook_batch(batch_id: str):
     task_manager.cancel_batch(batch_id)
 
     return {"success": True, "message": "批量任务取消请求已提交，正在让它们有序收工"}
+

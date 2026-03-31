@@ -126,13 +126,21 @@ codex-console.exe --access-password mypassword
 docker-compose up -d
 ```
 
-你可以在 `docker-compose.yml` 中修改环境变量，比如端口和访问密码。
+你可以在 `docker-compose.yml` 中修改环境变量，比如端口和访问密码。  
+如果需要看“全自动绑卡”的可视化浏览器，打开：
+
+- noVNC: `http://127.0.0.1:6080`
 
 ### 使用 docker run
 
 ```bash
 docker run -d \
   -p 1455:1455 \
+  -p 6080:6080 \
+  -e DISPLAY=:99 \
+  -e ENABLE_VNC=1 \
+  -e VNC_PORT=5900 \
+  -e NOVNC_PORT=6080 \
   -e WEBUI_HOST=0.0.0.0 \
   -e WEBUI_PORT=1455 \
   -e WEBUI_ACCESS_PASSWORD=your_secure_password \
@@ -204,6 +212,23 @@ dist/codex-console-windows-X64.exe
 当前仓库名:
 
 `codex-console`
+
+## 安全基线说明（新增）
+
+- `/api/*` 与 `/api/ws/*` 已统一接入登录鉴权。
+- 首次启动检测到默认口令或默认密钥时，会强制跳转到 `/setup-password` 完成改密。
+- 支付相关 API Key 不再使用代码内硬编码默认值，需通过环境变量或配置显式提供。
+
+## 数据库迁移（Alembic）
+
+```bash
+alembic revision --autogenerate -m "your_change"
+alembic upgrade head
+```
+
+初始化与更多说明见：
+
+- `alembic/README.md`
 
 ## 免责声明
 
